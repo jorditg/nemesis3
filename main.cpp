@@ -34,7 +34,7 @@ double error(const array &out,
              const array &pred)
 {
     array dif = (out - pred);
-    return sqrt((double)(sum<float>(dif * dif)));
+    return 0.5*sum<float>(dif * dif);
 }
 
 class ann {
@@ -42,6 +42,7 @@ class ann {
 private:
     int num_layers;
     vector<array> weights;
+    vector<array> weights_inc;
 
     // Add bias input to the output from previous layer
     array add_bias(const array &in);
@@ -50,7 +51,8 @@ private:
 
     void back_propagate(const vector<array> signal,
                         const array &pred,
-                        const double &alpha);
+                        const float &lr,
+                        const float &momentum);
 public:
 
     // Create a network with given parameters
@@ -60,13 +62,15 @@ public:
     array predict(const array &input);
 
     // Method to train the neural net
-    double train(const array &input, const array &target,
+    float train(const array &input, const array &target,
                  const array &input_test, const array &target_test,
-                 double alpha = 1.0,
-                 int max_epochs = 300,
-                 int batch_size = 100,
-                 double maxerr = 1.0,
-                 bool verbose = false);
+                 float lr = 0.1,
+                 float momentum = 0.9,
+                 int max_epochs = 100000,
+                 int batch_size = 128,
+                 float maxerr = 1.0,
+                 int testing_interval = 100,
+                 bool verbose = true);
 };
 
 inline array ann::add_bias(const array &in)
@@ -92,21 +96,24 @@ vector<array> ann::forward_propagate(const array& input)
 
 void ann::back_propagate(const vector<array> signal,
                          const array &target,
-                         const double &alpha)
+                         const float &lr,
+                         const float &momentum)
 {
 
     // Get error for output layer
     array out = signal[num_layers  - 1];
     array err = (out - target);
     int m = target.dims(0);
+    const float alpha = lr / m;
 
     for (int i = num_layers - 2; i >= 0; i--) {
         array in = add_bias(signal[i]);
         array delta = (activation_deriv(out) * err).T();
 
         // Adjust weights
-        array grad = -(alpha * matmul(delta, in)) / m;
-        weights[i] += grad.T();
+        array grad = -(alpha * matmul(delta, in));
+        weights_inc[i] = momentum * weights_inc[i] + (1.0 - momentum) * grad.T();
+        weights[i] += weights_inc[i];
 
         // Input to current layer is output of previous
         out = signal[i];
@@ -119,11 +126,13 @@ void ann::back_propagate(const vector<array> signal,
 
 ann::ann(vector<int> layers, double range) :
     num_layers(layers.size()),
-    weights(layers.size() - 1)
+    weights(layers.size() - 1),
+    weights_inc(layers.size() - 1)
 {
     // Generate uniformly distributed random numbers between [-range/2,range/2]
     for (int i = 0; i < num_layers - 1; i++) {
         weights[i] = range * randu(layers[i] + 1, layers[i + 1]) - range/2;
+        weights_inc[i] = constant(0.0, layers[i] + 1, layers[i + 1]);
     }
 }
 
@@ -134,54 +143,50 @@ array ann::predict(const array &input)
     return out;
 }
 
-double ann::train(const array &input, const array &target,
+float ann::train(const array &input, const array &target,
                   const array &input_test, const array &target_test,
-                  double alpha, int max_epochs, int batch_size,
-                  double maxerr, bool verbose)
+                  float lr, float momentum, int max_epochs, int batch_size,
+                  float maxerr, int testing_interval, bool verbose)
 {
 
     const int num_samples = input.dims(0);
     std::cout << "Num samples: " << num_samples << std::endl;
-    const int num_batches = num_samples / batch_size;
-    std::cout << "Num batches: " << num_batches << std::endl;
+    std::cout << "Batch size: " << batch_size << std::endl;
     
     double err = 0;
-
+    
     // Training the entire network
     for (int i = 0; i < max_epochs; i++) {
-        std::cout << "Epoch: " << i << std::endl;
-        for (int j = 0; j < num_batches - 1; j++) {
-
-            int st = j * batch_size;
-            int en = st + batch_size;
-
-            array x = input(seq(st, en), span);
-            array y = target(seq(st, en), span);
-
-            // Propagate the inputs forward
-            vector<array> signals = forward_propagate(x);
-            array out = signals[num_layers - 1];
-
-
-            // Propagate the error backward
-            back_propagate(signals, y, alpha);
-        }
         
-        // Validate with last batch
-        array out = predict(input_test);
-        err = error(out, target_test);
-        std::cout << "Test error: " << err << std::endl;
+        array idx = randu(batch_size, 1, u32);
+        idx = mod(idx, num_samples);
 
+        array x = lookup(input, idx, 0);
+        array y = lookup(target, idx, 0);
+
+        // Propagate the inputs forward
+        vector<array> signals = forward_propagate(x);
+        array out = signals[num_layers - 1];
+
+        // Propagate the error backward
+        back_propagate(signals, y, lr, momentum);
+        
+        if (i % testing_interval == 0) {
+            // Testing
+            array out = predict(input_test);
+            err = error(out, target_test);
+            if (verbose) {
+                printf("Epoch: %4d, Error: %0.4f\n", i, err);
+            }
+        }
+            
         // Check if convergence criteria has been met
         if (err < maxerr) {
             printf("Converged on Epoch: %4d\n", i + 1);
             return err;
         }
-
-        if (verbose) {
-            if ((i + 1) % 10 == 0) printf("Epoch: %4d, Error: %0.4f\n", i+1, err);
-        }
     }
+    
     return err;
 }
 
@@ -246,7 +251,7 @@ int ann_demo(bool console, int perc)
     // Network parameters
     vector<int> layers;
     layers.push_back(train_images.dims(1));
-    layers.push_back(64);
+    layers.push_back(65);
     layers.push_back(25);
     layers.push_back(train_target.dims(1));
 
@@ -257,11 +262,8 @@ int ann_demo(bool console, int perc)
     timer::start();
     network.train(train_images, train_target,
                   test_images, test_target,
-                  2.0, // learning rate / alpha
-                  250, // max epochs
-                  100, // batch size
-                  0.5, // max error
-                  true); // verbose
+                  0.1,
+                  0.9);
     af::sync();
     double train_time = timer::stop();
 
